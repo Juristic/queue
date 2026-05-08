@@ -33,13 +33,15 @@ async function run() {
   console.log(`Created in ${(performance.now() - createStart).toFixed(0)}ms`)
 
   for (let round = 1; round <= CLAIM_ROUNDS; round++) {
+    const dueAt = Date.now() - 1000
     const pipeline = connection.pipeline()
     for (let i = 0; i < SCHEDULE_COUNT; i++) {
       pipeline.hset(
         `schedules::bench-schedule-${i}`,
         'next_run_at',
-        (Date.now() - 1000).toString()
+        dueAt.toString()
       )
+      pipeline.zadd('schedules::due', dueAt, `bench-schedule-${i}`)
     }
     await pipeline.exec()
 

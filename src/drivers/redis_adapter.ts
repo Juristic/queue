@@ -16,6 +16,7 @@ import { resolveRetention } from '../utils.js'
 const redisKey = 'jobs'
 const schedulesKey = 'schedules'
 const schedulesIndexKey = 'schedules::index'
+const schedulesDueKey = 'schedules::due'
 type RedisConfig = Redis | RedisOptions
 
 /**
@@ -352,74 +353,90 @@ const GET_JOB_SCRIPT = `
 `
 
 /**
- * Lua script that finds and claims the first due schedule server-side.
+ * Lua script that claims the first due schedule using a sorted set index.
  *
- * Instead of iterating schedule IDs on the client (one EVAL round-trip per ID),
- * this script does the full scan inside Redis — reducing N round-trips to one.
+ * Uses ZRANGEBYSCORE on the schedules::due ZSET (scored by next_run_at)
+ * for O(log N) lookup instead of scanning all N schedule hashes.
  *
- * KEYS[1] = schedules index key  (e.g. "schedules::index")
- * ARGV[1] = schedules key prefix (e.g. "schedules::")
+ * Stale entries (paused, exhausted, deleted) are cleaned from the ZSET
+ * on sight, so subsequent calls skip them.
+ *
+ * KEYS[1] = schedules::due  (the ZSET, scored by next_run_at)
+ * ARGV[1] = schedules key prefix (e.g. "boringnode::queue::schedules::")
  * ARGV[2] = now  (epoch milliseconds as string)
  */
 const CLAIM_DUE_SCHEDULE_SCRIPT = `
-  local index_key = KEYS[1]
-  local prefix    = ARGV[1]
-  local now       = tonumber(ARGV[2])
+  local due_key = KEYS[1]
+  local prefix  = ARGV[1]
+  local now     = tonumber(ARGV[2])
 
-  local ids = redis.call('SMEMBERS', index_key)
+  while true do
+    local candidates = redis.call('ZRANGEBYSCORE', due_key, '-inf', tostring(now), 'LIMIT', 0, 1)
 
-  for _, id in ipairs(ids) do
-    local key  = prefix .. id
+    if #candidates == 0 then
+      return nil
+    end
+
+    local id  = candidates[1]
+    local key = prefix .. id
     local data = redis.call('HGETALL', key)
 
-    if #data > 0 then
+    -- Deleted schedule still in ZSET
+    if #data == 0 then
+      redis.call('ZREM', due_key, id)
+    else
       local schedule = {}
       for j = 1, #data, 2 do
         schedule[data[j]] = data[j + 1]
       end
 
-      if schedule.status == 'active' then
-        local next_run_at = tonumber(schedule.next_run_at)
+      if schedule.status ~= 'active' then
+        redis.call('ZREM', due_key, id)
+      else
+        local run_count = tonumber(schedule.run_count or '0')
+        local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
+        local to_date   = schedule.to_date and tonumber(schedule.to_date) or nil
 
-        if next_run_at and next_run_at <= now then
-          local run_count = tonumber(schedule.run_count or '0')
-          local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
-          local to_date   = schedule.to_date and tonumber(schedule.to_date) or nil
+        local eligible = true
+        if run_limit and run_count >= run_limit then eligible = false end
+        if to_date and now > to_date then eligible = false end
 
-          local eligible = true
-          if run_limit and run_count >= run_limit then eligible = false end
-          if to_date and now > to_date then eligible = false end
+        if not eligible then
+          redis.call('ZREM', due_key, id)
+        else
+          local new_run_count   = run_count + 1
+          local new_next_run_at = ''
 
-          if eligible then
-            local new_run_count  = run_count + 1
-            local new_next_run_at = ''
-
-            local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
-            if every_ms then
-              new_next_run_at = tostring(now + every_ms)
-            end
-
-            if run_limit and new_run_count >= run_limit then
-              new_next_run_at = ''
-            end
-
-            if to_date and new_next_run_at ~= '' and tonumber(new_next_run_at) > to_date then
-              new_next_run_at = ''
-            end
-
-            redis.call('HSET', key,
-              'next_run_at', new_next_run_at,
-              'last_run_at', tostring(now),
-              'run_count', tostring(new_run_count))
-
-            return cjson.encode(schedule)
+          local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
+          if every_ms then
+            new_next_run_at = tostring(now + every_ms)
           end
+
+          if run_limit and new_run_count >= run_limit then
+            new_next_run_at = ''
+          end
+
+          if to_date and new_next_run_at ~= '' and tonumber(new_next_run_at) > to_date then
+            new_next_run_at = ''
+          end
+
+          redis.call('HSET', key,
+            'next_run_at', new_next_run_at,
+            'last_run_at', tostring(now),
+            'run_count', tostring(new_run_count))
+
+          -- Update or remove from ZSET
+          if new_next_run_at ~= '' then
+            redis.call('ZADD', due_key, tonumber(new_next_run_at), id)
+          else
+            redis.call('ZREM', due_key, id)
+          end
+
+          return cjson.encode(schedule)
         end
       end
     end
   end
-
-  return nil
 `
 
 /**
@@ -698,10 +715,11 @@ export class RedisAdapter implements Adapter {
     const id = config.id ?? randomUUID()
     const now = Date.now()
     const scheduleKey = `${schedulesKey}::${id}`
-    const [existingRunCount, existingCreatedAt] = await this.#connection.hmget(
+    const [existingRunCount, existingCreatedAt, existingNextRunAt] = await this.#connection.hmget(
       scheduleKey,
       'run_count',
-      'created_at'
+      'created_at',
+      'next_run_at'
     )
 
     const scheduleData: Record<string, string> = {
@@ -720,13 +738,17 @@ export class RedisAdapter implements Adapter {
     if (config.to !== undefined) scheduleData.to_date = config.to.getTime().toString()
     if (config.limit !== undefined) scheduleData.run_limit = config.limit.toString()
 
-    // Upsert schedule and clear stale optional fields from previous config.
-    await this.#connection
+    const multi = this.#connection
       .multi()
       .hdel(scheduleKey, 'cron_expression', 'every_ms', 'from_date', 'to_date', 'run_limit')
       .hset(scheduleKey, scheduleData)
       .sadd(schedulesIndexKey, id)
-      .exec()
+
+    if (existingNextRunAt) {
+      multi.zadd(schedulesDueKey, Number.parseInt(existingNextRunAt, 10), id)
+    }
+
+    await multi.exec()
 
     return id
   }
@@ -802,14 +824,34 @@ export class RedisAdapter implements Adapter {
     }
     if (updates.runCount !== undefined) data.run_count = updates.runCount.toString()
 
-    if (Object.keys(data).length > 0) {
-      await this.#connection.hset(scheduleKey, data)
+    if (Object.keys(data).length === 0) return
+
+    const multi = this.#connection.multi().hset(scheduleKey, data)
+
+    if (updates.status === 'paused') {
+      multi.zrem(schedulesDueKey, id)
+    } else if (updates.nextRunAt) {
+      multi.zadd(schedulesDueKey, updates.nextRunAt.getTime(), id)
+    } else if (updates.nextRunAt === null) {
+      multi.zrem(schedulesDueKey, id)
+    } else if (updates.status === 'active') {
+      const existing = await this.#connection.hget(scheduleKey, 'next_run_at')
+      if (existing) {
+        multi.zadd(schedulesDueKey, Number.parseInt(existing, 10), id)
+      }
     }
+
+    await multi.exec()
   }
 
   async deleteSchedule(id: string): Promise<void> {
     const scheduleKey = `${schedulesKey}::${id}`
-    await this.#connection.multi().del(scheduleKey).srem(schedulesIndexKey, id).exec()
+    await this.#connection
+      .multi()
+      .del(scheduleKey)
+      .srem(schedulesIndexKey, id)
+      .zrem(schedulesDueKey, id)
+      .exec()
   }
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
@@ -820,7 +862,7 @@ export class RedisAdapter implements Adapter {
     const result = await this.#connection.eval(
       CLAIM_DUE_SCHEDULE_SCRIPT,
       1,
-      schedulesIndexKey,
+      schedulesDueKey,
       `${keyPrefix}${schedulesKey}::`,
       now.toString()
     )
@@ -852,10 +894,51 @@ export class RedisAdapter implements Adapter {
       }
 
       const scheduleKey = `${schedulesKey}::${data.id}`
-      await this.#connection.hset(scheduleKey, 'next_run_at', newNextRunAt.toString())
+      const multi = this.#connection.multi().hset(scheduleKey, 'next_run_at', newNextRunAt.toString())
+
+      if (newNextRunAt !== '') {
+        multi.zadd(schedulesDueKey, newNextRunAt as number, data.id)
+      } else {
+        multi.zrem(schedulesDueKey, data.id)
+      }
+
+      await multi.exec()
     }
 
     return this.#hashToScheduleData(data)
+  }
+
+  async backfillDueIndex(): Promise<number> {
+    const ids = await this.#connection.smembers(schedulesIndexKey)
+    if (ids.length === 0) return 0
+
+    const pipeline = this.#connection.pipeline()
+    for (const id of ids) {
+      pipeline.hmget(`${schedulesKey}::${id}`, 'next_run_at', 'status')
+    }
+
+    const results = await pipeline.exec()
+    if (!results) return 0
+
+    let count = 0
+    const addPipeline = this.#connection.pipeline()
+
+    for (let i = 0; i < ids.length; i++) {
+      const [err, values] = results[i]!
+      if (err) continue
+
+      const [nextRunAt, status] = values as [string | null, string | null]
+      if (status === 'active' && nextRunAt) {
+        addPipeline.zadd(schedulesDueKey, Number.parseInt(nextRunAt, 10), ids[i])
+        count++
+      }
+    }
+
+    if (count > 0) {
+      await addPipeline.exec()
+    }
+
+    return count
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {
