@@ -352,80 +352,74 @@ const GET_JOB_SCRIPT = `
 `
 
 /**
- * Lua script for atomically claiming a due schedule.
- * Takes a schedule key as KEYS[1] and checks if it's due.
- * Returns the schedule data if claimed, nil otherwise.
+ * Lua script that finds and claims the first due schedule server-side.
  *
- * This script is called per-schedule from the JS side which handles iteration.
+ * Instead of iterating schedule IDs on the client (one EVAL round-trip per ID),
+ * this script does the full scan inside Redis — reducing N round-trips to one.
+ *
+ * KEYS[1] = schedules index key  (e.g. "schedules::index")
+ * ARGV[1] = schedules key prefix (e.g. "schedules::")
+ * ARGV[2] = now  (epoch milliseconds as string)
  */
-const CLAIM_SCHEDULE_SCRIPT = `
-  local schedule_key = KEYS[1]
-  local now = tonumber(ARGV[1])
+const CLAIM_DUE_SCHEDULE_SCRIPT = `
+  local index_key = KEYS[1]
+  local prefix    = ARGV[1]
+  local now       = tonumber(ARGV[2])
 
-  -- Get schedule data
-  local data = redis.call('HGETALL', schedule_key)
-  if #data == 0 then
-    return nil
+  local ids = redis.call('SMEMBERS', index_key)
+
+  for _, id in ipairs(ids) do
+    local key  = prefix .. id
+    local data = redis.call('HGETALL', key)
+
+    if #data > 0 then
+      local schedule = {}
+      for j = 1, #data, 2 do
+        schedule[data[j]] = data[j + 1]
+      end
+
+      if schedule.status == 'active' then
+        local next_run_at = tonumber(schedule.next_run_at)
+
+        if next_run_at and next_run_at <= now then
+          local run_count = tonumber(schedule.run_count or '0')
+          local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
+          local to_date   = schedule.to_date and tonumber(schedule.to_date) or nil
+
+          local eligible = true
+          if run_limit and run_count >= run_limit then eligible = false end
+          if to_date and now > to_date then eligible = false end
+
+          if eligible then
+            local new_run_count  = run_count + 1
+            local new_next_run_at = ''
+
+            local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
+            if every_ms then
+              new_next_run_at = tostring(now + every_ms)
+            end
+
+            if run_limit and new_run_count >= run_limit then
+              new_next_run_at = ''
+            end
+
+            if to_date and new_next_run_at ~= '' and tonumber(new_next_run_at) > to_date then
+              new_next_run_at = ''
+            end
+
+            redis.call('HSET', key,
+              'next_run_at', new_next_run_at,
+              'last_run_at', tostring(now),
+              'run_count', tostring(new_run_count))
+
+            return cjson.encode(schedule)
+          end
+        end
+      end
+    end
   end
 
-  -- Convert HGETALL result to table
-  local schedule = {}
-  for j = 1, #data, 2 do
-    schedule[data[j]] = data[j + 1]
-  end
-
-  -- Check if schedule is due
-  if schedule.status ~= 'active' then
-    return nil
-  end
-
-  local next_run_at = tonumber(schedule.next_run_at)
-  if not next_run_at or next_run_at > now then
-    return nil
-  end
-
-  local run_count = tonumber(schedule.run_count or '0')
-  local run_limit = schedule.run_limit and tonumber(schedule.run_limit) or nil
-  local to_date = schedule.to_date and tonumber(schedule.to_date) or nil
-
-  -- Check limits
-  if run_limit and run_count >= run_limit then
-    return nil
-  end
-
-  if to_date and now > to_date then
-    return nil
-  end
-
-  -- This schedule is claimable - atomically update it
-  local new_run_count = run_count + 1
-
-  -- Calculate new next_run_at (simple interval-based for now)
-  -- Complex cron calculation happens in the caller
-  local new_next_run_at = ''
-  local every_ms = schedule.every_ms and tonumber(schedule.every_ms) or nil
-  if every_ms then
-    new_next_run_at = tostring(now + every_ms)
-  end
-
-  -- Check if we've hit the limit after this run
-  if run_limit and new_run_count >= run_limit then
-    new_next_run_at = ''
-  end
-
-  -- Check if past end date
-  if to_date and new_next_run_at ~= '' and tonumber(new_next_run_at) > to_date then
-    new_next_run_at = ''
-  end
-
-  -- Update the schedule atomically
-  redis.call('HSET', schedule_key,
-    'next_run_at', new_next_run_at,
-    'last_run_at', tostring(now),
-    'run_count', tostring(new_run_count))
-
-  -- Return the schedule data (before update) as JSON
-  return cjson.encode(schedule)
+  return nil
 `
 
 /**
@@ -820,57 +814,48 @@ export class RedisAdapter implements Adapter {
 
   async claimDueSchedule(): Promise<ScheduleData | null> {
     const now = Date.now()
-    const ids = await this.#connection.smembers(schedulesIndexKey)
 
-    // Try to claim each schedule atomically using Lua script
-    for (const id of ids) {
-      const scheduleKey = `${schedulesKey}::${id}`
+    const keyPrefix = this.#connection.options.keyPrefix ?? ''
 
-      // Use Lua script for atomic check-and-update
-      const result = await this.#connection.eval(
-        CLAIM_SCHEDULE_SCRIPT,
-        1,
-        scheduleKey,
-        now.toString()
-      )
+    const result = await this.#connection.eval(
+      CLAIM_DUE_SCHEDULE_SCRIPT,
+      1,
+      schedulesIndexKey,
+      `${keyPrefix}${schedulesKey}::`,
+      now.toString()
+    )
 
-      if (!result) {
-        continue
-      }
-
-      const data = JSON.parse(result as string) as Record<string, string>
-
-      // If cron expression, we need to recalculate next_run_at properly
-      // The Lua script only handles simple interval; cron needs JS cron-parser
-      // This is safe because the schedule is already claimed (run_count incremented)
-      if (data.cron_expression) {
-        const { CronExpressionParser } = await import('cron-parser')
-        const cron = CronExpressionParser.parse(data.cron_expression, {
-          currentDate: new Date(now),
-          tz: data.timezone || 'UTC',
-        })
-        const nextRun = cron.next().toDate().getTime()
-
-        // Check limits before updating
-        const runCount = Number.parseInt(data.run_count || '0', 10) + 1
-        const runLimit = data.run_limit ? Number.parseInt(data.run_limit, 10) : null
-        const toDate = data.to_date ? Number.parseInt(data.to_date, 10) : null
-
-        let newNextRunAt: number | string = nextRun
-
-        if (runLimit !== null && runCount >= runLimit) {
-          newNextRunAt = ''
-        } else if (toDate && nextRun > toDate) {
-          newNextRunAt = ''
-        }
-
-        await this.#connection.hset(scheduleKey, 'next_run_at', newNextRunAt.toString())
-      }
-
-      return this.#hashToScheduleData(data)
+    if (!result) {
+      return null
     }
 
-    return null
+    const data = JSON.parse(result as string) as Record<string, string>
+
+    if (data.cron_expression) {
+      const { CronExpressionParser } = await import('cron-parser')
+      const cron = CronExpressionParser.parse(data.cron_expression, {
+        currentDate: new Date(now),
+        tz: data.timezone || 'UTC',
+      })
+      const nextRun = cron.next().toDate().getTime()
+
+      const runCount = Number.parseInt(data.run_count || '0', 10) + 1
+      const runLimit = data.run_limit ? Number.parseInt(data.run_limit, 10) : null
+      const toDate = data.to_date ? Number.parseInt(data.to_date, 10) : null
+
+      let newNextRunAt: number | string = nextRun
+
+      if (runLimit !== null && runCount >= runLimit) {
+        newNextRunAt = ''
+      } else if (toDate && nextRun > toDate) {
+        newNextRunAt = ''
+      }
+
+      const scheduleKey = `${schedulesKey}::${data.id}`
+      await this.#connection.hset(scheduleKey, 'next_run_at', newNextRunAt.toString())
+    }
+
+    return this.#hashToScheduleData(data)
   }
 
   #hashToScheduleData(data: Record<string, string>): ScheduleData {
